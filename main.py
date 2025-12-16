@@ -5,6 +5,8 @@ import joblib
 import numpy as np
 import json
 from typing import Optional
+import sys
+import pickle
 
 app = FastAPI(
     title="Faminga Yield Prediction API",
@@ -21,15 +23,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models and preprocessing objects
+# Load models and preprocessing objects with compatibility handling
 try:
-    model = joblib.load("crop_yield_model_gradient_boosting.pkl")
-    scaler = joblib.load("scaler.pkl")
+    print(f"🐍 Python version: {sys.version}")
+    print("📦 Loading models...")
+
+    # Try loading with joblib first
+    try:
+        model = joblib.load("crop_yield_model_gradient_boosting.pkl")
+        scaler = joblib.load("scaler.pkl")
+    except ModuleNotFoundError as e:
+        print(f"⚠️ Joblib loading failed: {e}")
+        print("🔄 Trying alternative loading method with pickle...")
+
+        # Fallback to standard pickle with custom unpickler
+        import importlib
+
+        class CompatibleUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                # Handle sklearn internal modules that may have moved
+                if module.startswith('sklearn.ensemble._gb_losses'):
+                    module = 'sklearn.ensemble._gb'
+                elif '_loss' in module:
+                    # Map old loss modules to new ones
+                    module = module.replace('._loss', '.ensemble._gb')
+
+                try:
+                    return super().find_class(module, name)
+                except (ModuleNotFoundError, AttributeError):
+                    # Try importing from sklearn.ensemble._gb
+                    if 'loss' in name.lower() or 'loss' in module.lower():
+                        try:
+                            mod = importlib.import_module('sklearn.ensemble._gb')
+                            return getattr(mod, name)
+                        except:
+                            pass
+                    raise
+
+        with open("crop_yield_model_gradient_boosting.pkl", "rb") as f:
+            model = CompatibleUnpickler(f).load()
+
+        with open("scaler.pkl", "rb") as f:
+            scaler = CompatibleUnpickler(f).load()
+
     with open("feature_names.json", "r") as f:
         feature_names = json.load(f)
+
     print("✅ Models loaded successfully")
+
 except Exception as e:
     print(f"❌ Error loading models: {e}")
+    print(f"📍 Error type: {type(e).__name__}")
+    import traceback
+    traceback.print_exc()
     raise
 
 class YieldPredictionInput(BaseModel):
@@ -97,41 +143,41 @@ def preprocess_input(data: YieldPredictionInput) -> np.ndarray:
         'fertilizer_kg_per_ha': data.fertilizer_kg_per_ha,
         'irrigation': data.irrigation
     }
-    
+
     # Feature engineering (matching notebook preprocessing)
     features['npk_ratio'] = (data.nitrogen_ppm + data.phosphorus_ppm + data.potassium_ppm) / 3
     features['rainfall_per_temp'] = data.total_rainfall_mm / data.avg_temperature_c if data.avg_temperature_c > 0 else 0
     features['nutrient_efficiency'] = 0  # This is calculated post-prediction in training
-    
+
     # One-hot encode crop_type
     features['crop_type_beans'] = 1 if data.crop_type.lower() == 'beans' else 0
     features['crop_type_maize'] = 1 if data.crop_type.lower() == 'maize' else 0
-    
+
     # Convert to array in correct order
     feature_array = np.array([[features.get(name, 0) for name in feature_names]])
-    
+
     # Scale features
     scaled_features = scaler.transform(feature_array)
-    
+
     return scaled_features
 
 def generate_recommendations(prediction: float, data: YieldPredictionInput) -> list[str]:
     """Generate farming recommendations based on prediction and input"""
     recommendations = []
-    
+
     if prediction < 3000:
         recommendations.append("⚠️ Low yield predicted. Consider soil testing and nutrient supplementation.")
     elif prediction > 5500:
         recommendations.append("✅ High yield potential! Maintain current practices.")
     else:
         recommendations.append("📊 Moderate yield expected. Room for optimization.")
-    
+
     # Soil recommendations
     if data.soil_ph < 5.5:
         recommendations.append("🌱 Soil is acidic. Consider lime application to raise pH.")
     elif data.soil_ph > 7.5:
         recommendations.append("🌱 Soil is alkaline. Monitor nutrient availability.")
-    
+
     # Fertilizer recommendations
     if data.nitrogen_ppm < 50:
         recommendations.append("💧 Low nitrogen levels. Apply nitrogen-rich fertilizer.")
@@ -139,11 +185,11 @@ def generate_recommendations(prediction: float, data: YieldPredictionInput) -> l
         recommendations.append("💧 Low phosphorus. Consider phosphate fertilizer.")
     if data.potassium_ppm < 150:
         recommendations.append("💧 Low potassium. Apply potash fertilizer.")
-    
+
     # Irrigation recommendations
     if data.irrigation == 0 and data.total_rainfall_mm < 600:
         recommendations.append("💦 Low rainfall detected. Consider installing irrigation system.")
-    
+
     return recommendations
 
 @app.get("/")
@@ -174,34 +220,34 @@ def health_check():
 def predict_yield(data: YieldPredictionInput):
     """
     Predict crop yield based on input parameters
-    
+
     Returns predicted yield in kg/ha along with recommendations
     """
     try:
         # Validate crop type
         if data.crop_type.lower() not in ['beans', 'maize']:
             raise HTTPException(status_code=400, detail="crop_type must be 'beans' or 'maize'")
-        
+
         # Preprocess input
         processed_data = preprocess_input(data)
-        
+
         # Make prediction
         prediction = model.predict(processed_data)[0]
         prediction = max(0, prediction)  # Ensure non-negative yield
-        
+
         # Generate recommendations
         recommendations = generate_recommendations(prediction, data)
-        
+
         # Determine confidence based on input quality
         confidence = "high" if data.irrigation == 1 and data.fertilizer_kg_per_ha > 80 else "moderate"
-        
+
         return YieldPredictionOutput(
             predicted_yield_kg_per_ha=round(prediction, 2),
             crop_type=data.crop_type,
             confidence=confidence,
             recommendations=recommendations
         )
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
